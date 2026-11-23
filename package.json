@@ -1,0 +1,85 @@
+{
+  "name": "antigravity-file-actions",
+  "displayName": "Antigravity File Actions",
+  "description": "在 Antigravity IDE 右侧原生 AI Agent 对话窗口的文件链接/路径上直接右键：使用系统默认程序打开、在 Windows 资源管理器中显示、复制文件绝对路径。",
+  "version": "0.2.0",
+  "publisher": "local-dev",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ITer99/antigravity-file-actions.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "files": [
+    "extension.js",
+    "renderer-inject.js",
+    "package.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "antigravityFileActions.open",
+        "title": "文件操作: 使用系统默认程序打开"
+      },
+      {
+        "command": "antigravityFileActions.reveal",
+        "title": "文件操作: 在 Windows 资源管理器中显示"
+      },
+      {
+        "command": "antigravityFileActions.copyPath",
+        "title": "文件操作: 复制文件绝对路径"
+      },
+      {
+        "command": "antigravityFileActions.installPatch",
+        "title": "文件操作: 安装/更新 AI 对话窗口右键菜单补丁"
+      },
+      {
+        "command": "antigravityFileActions.uninstallPatch",
+        "title": "文件操作: 卸载 AI 对话窗口右键菜单补丁（恢复原始文件）"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "antigravityFileActions.open",
+          "group": "navigation@30",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "antigravityFileActions.reveal",
+          "group": "navigation@31",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "antigravityFileActions.copyPath",
+          "group": "navigation@32",
+          "when": "resourceScheme == file"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "antigravityFileActions.open",
+          "group": "navigation@30",
+          "when": "resourceScheme == file"
+        },
+        {
+          "command": "antigravityFileActions.reveal",
+          "group": "navigation@31",
+          "when": "resourceScheme == file"
+        }
+      ]
+    }
+  }
+}
