@@ -160,14 +160,46 @@ function inspectPathStatus(rawInput, extraHints = []) {
 // -----------------------------------------------------------------------------
 // 2. OS File Operations (Windows 10/11)
 // -----------------------------------------------------------------------------
+const STRIPPED_ENV_EXACT = new Set([
+  'CHROME_CRASHPAD_PIPE_NAME',
+  'NODE_OPTIONS',
+  'NODE_EXTRA_CA_CERTS',
+  'NODE_USE_SYSTEM_CA',
+  'NODE_CHANNEL_FD',
+  'NODE_CHANNEL_SERIALIZATION_MODE',
+  'ORIGINAL_XDG_CURRENT_DESKTOP'
+]);
+
+const STRIPPED_ENV_PREFIXES = [
+  'ELECTRON_',
+  'VSCODE_',
+  'ANTIGRAVITY_'
+];
+
+function buildCleanExternalEnv(baseEnv = process.env) {
+  const clean = {};
+  for (const [key, value] of Object.entries(baseEnv || {})) {
+    if (value === undefined) continue;
+    const upper = key.toUpperCase();
+    if (STRIPPED_ENV_EXACT.has(upper)) continue;
+    if (STRIPPED_ENV_PREFIXES.some(prefix => upper.startsWith(prefix))) continue;
+    clean[key] = value;
+  }
+  return clean;
+}
+
 function execPowerShellEncoded(psScript) {
   const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
   return new Promise((resolve, reject) => {
     execFile(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded],
-      { windowsHide: true },
-      (error) => (error ? reject(error) : resolve())
+      { windowsHide: true, env: buildCleanExternalEnv() },
+      (error, _stdout, stderr) => {
+        if (!error) return resolve();
+        const detail = (stderr || '').trim();
+        reject(detail ? new Error(detail) : error);
+      }
     );
   });
 }
@@ -195,6 +227,7 @@ async function defaultOpen(file, options = {}) {
   const escaped = normalized.replace(/'/g, "''");
   const workDir = path.dirname(normalized).replace(/'/g, "''");
   const ps = [
+    `$ErrorActionPreference = 'Stop'`,
     `$psi = New-Object System.Diagnostics.ProcessStartInfo`,
     `$psi.FileName = '${escaped}'`,
     `$psi.WorkingDirectory = '${workDir}'`,
@@ -224,7 +257,8 @@ async function revealInExplorer(file) {
     const args = stat.isDirectory() ? [`"${normalized}"`] : [`/select,"${normalized}"`];
     const child = spawn('explorer.exe', args, {
       windowsVerbatimArguments: true,
-      windowsHide: false
+      windowsHide: false,
+      env: buildCleanExternalEnv()
     });
     child.on('error', reject);
     child.on('close', () => {
@@ -1026,5 +1060,7 @@ module.exports = {
   installRendererPatch,
   uninstallRendererPatch,
   resolveToWindowsPath,
-  inspectPathStatus
+  inspectPathStatus,
+  buildCleanExternalEnv,
+  defaultOpen
 };

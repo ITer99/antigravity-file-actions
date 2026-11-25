@@ -26,6 +26,7 @@
 3. **严格的作用域与安全边界**
    - **零干扰**：仅在识别到本地文件链接/路径时弹出菜单；在普通对话文本、`http/https` 网页链接、输入框或多行代码块上右键时，保持 Antigravity 原生右键行为。
    - **可执行文件安全确认**：对 `.exe`、`.bat`、`.cmd`、`.ps1`、`.vbs`、`.js`、`.msi`、`.reg` 等可执行文件或脚本，选择「使用系统默认程序打开」前强制弹出模态安全确认框，未经确认绝不执行。
+   - **外部进程环境隔离**：调用 Windows 默认程序时自动剥离 `ELECTRON_*`（如 `ELECTRON_RUN_AS_NODE`）、`VSCODE_*`、`ANTIGRAVITY_*` 等宿主环境变量，彻底解决 Typora、Obsidian、MarkText、VS Code 等基于 Electron 的默认关联程序无法拉起的问题。
 
 4. **版本更新友好与一键恢复**
    - 扩展激活时自动检测并维护渲染层与内置 `agy` Webview 代理注入（兼容 `/` 与 `/c/<conversationId>` 等全部会话路由）。
@@ -38,11 +39,11 @@
 
 ### 方式 1：直接安装 Release 中的 `.vsix`（推荐）
 
-1. 从 GitHub Releases 下载最新的 `antigravity-file-actions-0.2.0.vsix`。
+1. 从 GitHub Releases 下载最新的 `antigravity-file-actions-0.2.1.vsix`。
 2. 在 PowerShell 中执行以下命令安装到 Antigravity IDE：
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Antigravity IDE\bin\antigravity-ide.cmd" --install-extension .\antigravity-file-actions-0.2.0.vsix --force
+& "$env:LOCALAPPDATA\Programs\Antigravity IDE\bin\antigravity-ide.cmd" --install-extension .\antigravity-file-actions-0.2.1.vsix --force
 ```
 
 3. 打开或切换到 Antigravity IDE，按 `Ctrl+Shift+P` 执行 `Developer: Reload Window`（重新加载窗口）即可生效。
@@ -50,10 +51,10 @@
 ### 方式 2：从源码打包安装
 
 ```powershell
-git clone <repo-url>
+git clone https://github.com/ITer99/antigravity-file-actions.git
 cd antigravity-file-actions
 npx.cmd --yes @vscode/vsce package --allow-missing-repository
-& "$env:LOCALAPPDATA\Programs\Antigravity IDE\bin\antigravity-ide.cmd" --install-extension .\antigravity-file-actions-0.2.0.vsix --force
+& "$env:LOCALAPPDATA\Programs\Antigravity IDE\bin\antigravity-ide.cmd" --install-extension .\antigravity-file-actions-0.2.1.vsix --force
 ```
 
 ---
@@ -100,6 +101,17 @@ antigravity-file-actions/
 └── README.md             # 项目说明文档
 ```
 
-## 六、许可证
+## 六、更新日志
+
+### v0.2.1
+- **修复 Markdown 等文件使用 Electron 默认程序打开无效的问题**：调用系统默认程序与资源管理器时自动清理 `ELECTRON_RUN_AS_NODE`、`ELECTRON_*`、`VSCODE_*`、`ANTIGRAVITY_*` 等宿主环境变量，修复 Typora、Obsidian、MarkText、VS Code 等 Electron 应用以 Node.js 模式异常退出的问题。
+- **完善错误反馈**：系统默认程序调用启用 PowerShell `$ErrorActionPreference = 'Stop'` 并透出 `stderr` 报错信息。
+
+### v0.2.0
+- 首次发布：支持 Antigravity IDE 右侧原生 AI Agent 对话窗口本地文件链接/路径右键菜单（使用系统默认程序打开、在 Windows 资源管理器中显示、复制文件绝对路径）。
+
+---
+
+## 七、许可证
 
 [MIT](./LICENSE)
