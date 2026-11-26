@@ -8,9 +8,16 @@
   const BRIDGE_PORTS = [49821, 49822, 49823];
   let activePort = BRIDGE_PORTS[0];
 
+  const IS_MAC = typeof window !== 'undefined' && (
+    window.__AFA_PLATFORM__ === 'darwin' ||
+    /Mac|iPhone|iPad|iPod/i.test((typeof navigator !== 'undefined' && (navigator.platform || navigator.userAgent)) || '')
+  );
+
   const DANGEROUS_EXTS = new Set([
     '.exe', '.bat', '.cmd', '.ps1', '.vbs', '.js', '.jse',
-    '.wsf', '.msi', '.scr', '.hta', '.com', '.pif', '.reg', '.msc', '.jar'
+    '.wsf', '.msi', '.scr', '.hta', '.com', '.pif', '.reg', '.msc', '.jar',
+    '.app', '.command', '.sh', '.zsh', '.bash', '.csh', '.pkg', '.dmg',
+    '.workflow', '.scpt', '.applescript', '.tool', '.action', '.osax'
   ]);
 
   const NON_FILE_SCHEMES = new Set([
@@ -70,14 +77,52 @@
     }
   }
 
-  function uriToWinPath(uriStr) {
+  function uriToLocalPath(uriStr) {
     if (!uriStr || typeof uriStr !== 'string') return '';
     let s = uriStr.trim();
-    if (!/^file:\/\//i.test(s) && !/^vscode-remote:\/\//i.test(s)) return s;
-    let p = s.replace(/^(?:file|vscode-remote):\/\/\/?/i, '');
+    if (!/^file:\/\//i.test(s) && !/^vscode-remote:\/\//i.test(s)) {
+      if (/^[a-zA-Z]:[\\/]/.test(s) || /^\\\\/.test(s)) return normalizeWinPath(s);
+      if (s.startsWith('/') || s.startsWith('~/') || s === '~') return normalizePosixPath(s);
+      return s;
+    }
+    let p = s.replace(/^(?:file|vscode-remote):\/\/(?:localhost)?/i, '');
     p = safeDecodeUriPath(p);
-    if (/^\/[a-zA-Z]:/.test(p)) p = p.slice(1);
-    return normalizeWinPath(p);
+    if (/^\/[a-zA-Z]:/.test(p)) {
+      return normalizeWinPath(p.slice(1));
+    }
+    if (/^[a-zA-Z]:[\\/]/.test(p) || /^\\\\/.test(p)) {
+      return normalizeWinPath(p);
+    }
+    if (!p.startsWith('/')) p = '/' + p;
+    return normalizePosixPath(p);
+  }
+
+  function normalizePosixPath(inputPath) {
+    if (!inputPath || typeof inputPath !== 'string') return '';
+    let s = inputPath.trim().replace(/\/+/g, '/');
+    if (!s) return '';
+    const isHome = s === '~' || s.startsWith('~/');
+    const isAbs = s.startsWith('/');
+    const parts = s.split('/');
+    const stack = [];
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (!part || part === '.') continue;
+      if (i === 0 && isHome && part === '~') {
+        stack.push('~');
+        continue;
+      }
+      if (part === '..') {
+        if (stack.length > 0 && !(stack.length === 1 && stack[0] === '~')) {
+          stack.pop();
+        }
+      } else {
+        stack.push(part);
+      }
+    }
+    if (isAbs) return '/' + stack.join('/');
+    if (isHome) return stack.length > 0 ? stack.join('/') : '~';
+    return stack.join('/') || '.';
   }
 
   function normalizeWinPath(inputPath) {
@@ -107,12 +152,16 @@
     return out;
   }
 
+  function isAbsoluteLocalRoot(p) {
+    return Boolean(p && (/^[a-zA-Z]:\\/.test(p) || /^\\\\/.test(p) || p.startsWith('/')));
+  }
+
   function getWindowWorkspaceHints() {
     const hints = [];
     const addHintUri = (rawUri) => {
       if (!rawUri || typeof rawUri !== 'string') return;
-      const p = uriToWinPath(rawUri);
-      if (p && /^[a-zA-Z]:\\/.test(p) && !hints.includes(p)) {
+      const p = uriToLocalPath(rawUri);
+      if (isAbsoluteLocalRoot(p) && !hints.includes(p)) {
         hints.push(p);
       }
     };
@@ -131,18 +180,18 @@
         if (cfg.folderUri) {
           const u = typeof cfg.folderUri === 'string'
             ? cfg.folderUri
-            : (cfg.folderUri.fsPath || cfg.folderUri.path || cfg.folderUri.external || '');
-          const p = uriToWinPath(u.startsWith('file:') ? u : ('file:///' + u.replace(/^\/+/, '')));
-          if (p && /^[a-zA-Z]:\\/.test(p) && !hints.includes(p)) hints.push(p);
+            : (cfg.folderUri.external || cfg.folderUri.fsPath || cfg.folderUri.path || '');
+          const p = u ? uriToLocalPath(u) : '';
+          if (isAbsoluteLocalRoot(p) && !hints.includes(p)) hints.push(p);
         }
         if (cfg.workspace && cfg.workspace.configPath) {
-          const u = cfg.workspace.configPath.fsPath || cfg.workspace.configPath.path || '';
-          const p = uriToWinPath(u.startsWith('file:') ? u : ('file:///' + u.replace(/^\/+/, '')));
-          if (p && /^[a-zA-Z]:\\/.test(p)) {
-            const lastSep = p.lastIndexOf('\\');
-            if (lastSep > 2) {
+          const u = cfg.workspace.configPath.external || cfg.workspace.configPath.fsPath || cfg.workspace.configPath.path || '';
+          const p = u ? uriToLocalPath(u) : '';
+          if (isAbsoluteLocalRoot(p)) {
+            const lastSep = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
+            if (lastSep > 0) {
               const dir = p.slice(0, lastSep);
-              if (!hints.includes(dir)) hints.push(dir);
+              if (isAbsoluteLocalRoot(dir) && !hints.includes(dir)) hints.push(dir);
             }
           }
         }
@@ -154,6 +203,25 @@
   // ---------------------------------------------------------------------------
   // 2. Path Parsing & Classification
   // ---------------------------------------------------------------------------
+  const POSIX_KNOWN_ROOT_RE = /^\/(?:Users|Volumes|Applications|Library|System|opt|usr|etc|var|tmp|private|home|mnt|srv|root|workspace)(?:\/|$)/;
+
+  function isLikelyPosixAbsPath(s, sourceType) {
+    if (!s || !s.startsWith('/') || s.startsWith('//')) return false;
+    if (/[<>:"|?*]/.test(s)) return false;
+    if (POSIX_KNOWN_ROOT_RE.test(s)) return s.length > 1;
+    const segments = s.split('/').filter(Boolean);
+    if (segments.length === 0) return false;
+    if (sourceType === 'data-uri' || sourceType === 'anchor') {
+      return segments.length >= 2 || (segments.length === 1 && (COMMON_FILE_EXTS.has(getExtension(segments[0])) || KNOWN_BARE_FILENAMES.has(segments[0].toLowerCase())));
+    }
+    if (sourceType === 'code' && segments.length >= 2) {
+      const lastSeg = segments[segments.length - 1];
+      const ext = getExtension(lastSeg);
+      return Boolean(COMMON_FILE_EXTS.has(ext) || KNOWN_BARE_FILENAMES.has(lastSeg.toLowerCase()));
+    }
+    return false;
+  }
+
   function stripLineAndColSuffix(raw) {
     if (!raw || typeof raw !== 'string') return '';
     let s = raw.trim();
@@ -197,7 +265,7 @@
 
   /**
    * Determines whether a candidate string from DOM is a local file path.
-   * Returns { kind: 'file-uri' | 'win-abs' | 'rel-path' | 'bare-file', rawPath, normalizedPath } or null.
+   * Returns { kind: 'file-uri' | 'win-abs' | 'posix-abs' | 'rel-path' | 'bare-file', rawPath, normalizedPath } or null.
    */
   function parseLocalPathCandidate(rawInput, sourceType) {
     const cleaned = cleanRawInput(rawInput);
@@ -211,12 +279,12 @@
         // Windows drive letter like G:\ or C:/
       } else if (scheme === 'file' || scheme === 'vscode-remote') {
         const stripped = stripLineAndColSuffix(cleaned);
-        const winPath = uriToWinPath(stripped);
-        if (!winPath || !/^(?:[a-zA-Z]:\\|\\\\)/.test(winPath)) return null;
+        const localPath = uriToLocalPath(stripped);
+        if (!localPath || !(/^(?:[a-zA-Z]:\\|\\\\|\/)/.test(localPath))) return null;
         return {
           kind: 'file-uri',
           rawPath: cleaned,
-          normalizedPath: winPath,
+          normalizedPath: localPath,
           isAbsolute: true
         };
       } else if (NON_FILE_SCHEMES.has(scheme) || cleaned.includes('://')) {
@@ -250,12 +318,32 @@
       };
     }
 
+    // 2b. Home shorthand path ~/...
+    if (/^~\/[^\s"'<>|?*`]+$/.test(stripped)) {
+      return {
+        kind: 'posix-abs',
+        rawPath: stripped,
+        normalizedPath: normalizePosixPath(stripped),
+        isAbsolute: true
+      };
+    }
+
+    // 2c. macOS / POSIX Absolute Path (/Users/..., /Volumes/..., etc.)
+    if (isLikelyPosixAbsPath(stripped, sourceType)) {
+      return {
+        kind: 'posix-abs',
+        rawPath: stripped,
+        normalizedPath: normalizePosixPath(stripped),
+        isAbsolute: true
+      };
+    }
+
     // For strict sources (like plain text cursor lookup), require absolute path or file:// URI
     if (sourceType === 'plain-text') {
       return null;
     }
 
-    // Reject strings with illegal Windows filename characters
+    // Reject strings with illegal filename characters
     if (/[<>:"|?*]/.test(stripped)) return null;
     if (CODE_FALSE_POSITIVES.has(stripped.toLowerCase())) return null;
 
@@ -270,7 +358,12 @@
       const isExplicitRel = stripped.startsWith('./') || stripped.startsWith('.\\') || stripped.startsWith('../') || stripped.startsWith('..\\');
       if (isExplicitRel || COMMON_FILE_EXTS.has(ext) || KNOWN_BARE_FILENAMES.has(lastSeg.toLowerCase()) || sourceType === 'data-uri' || sourceType === 'anchor') {
         const hints = getWindowWorkspaceHints();
-        const fallbackAbs = hints.length > 0 ? normalizeWinPath(hints[0] + '\\' + stripped) : stripped;
+        let fallbackAbs = stripped;
+        if (hints.length > 0) {
+          fallbackAbs = hints[0].startsWith('/')
+            ? normalizePosixPath(hints[0] + '/' + stripped.replace(/\\/g, '/'))
+            : normalizeWinPath(hints[0] + '\\' + stripped);
+        }
         return {
           kind: 'rel-path',
           rawPath: stripped,
@@ -289,7 +382,12 @@
       // Reject camelCase.method patterns unless ext is a known file extension and not .log on console.log
       if (COMMON_FILE_EXTS.has(ext) || KNOWN_BARE_FILENAMES.has(lower)) {
         const hints = getWindowWorkspaceHints();
-        const fallbackAbs = hints.length > 0 ? normalizeWinPath(hints[0] + '\\' + stripped) : stripped;
+        let fallbackAbs = stripped;
+        if (hints.length > 0) {
+          fallbackAbs = hints[0].startsWith('/')
+            ? normalizePosixPath(hints[0] + '/' + stripped)
+            : normalizeWinPath(hints[0] + '\\' + stripped);
+        }
         return {
           kind: 'bare-file',
           rawPath: stripped,
@@ -355,10 +453,12 @@
     );
     if (!insideRect) return null;
 
-    // Match file:///... or Windows absolute path G:\... around offset
+    // Match file:///..., Windows absolute path G:\..., macOS/POSIX known roots, or ~/... around offset
     const patterns = [
       /file:\/\/\/[^\s"'<>()`]+/gi,
-      /[a-zA-Z]:[\\/][^\s"'<>|?*`]+/g
+      /[a-zA-Z]:[\\/][^\s"'<>|?*`]+/g,
+      /\/(?:Users|Volumes|Applications|Library|System|opt|usr|etc|var|tmp|private|home|mnt|srv|root|workspace)\/[^\s"'<>|?*`]+/g,
+      /~\/[^\s"'<>|?*`]+/g
     ];
     for (const re of patterns) {
       let m;
@@ -921,7 +1021,7 @@
       },
       {
         id: 'reveal',
-        label: '在 Windows 资源管理器中显示',
+        label: IS_MAC ? '在访达中显示' : '在 Windows 资源管理器中显示',
         iconPaths: ['M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v6.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5v-8Z']
       },
       { type: 'separator' },

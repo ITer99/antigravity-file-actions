@@ -2,20 +2,27 @@
 
 const vscode = require('vscode');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { execFile, spawn } = require('child_process');
 
+const IS_WIN = process.platform === 'win32';
+const IS_MAC = process.platform === 'darwin';
+const IS_SUPPORTED_PLATFORM = IS_WIN || IS_MAC;
+
 const BRIDGE_PORTS = [49821, 49822, 49823];
 const PATCH_START_MARKER = '/* __ANTIGRAVITY_FILE_ACTIONS_START__ */';
 const PATCH_END_MARKER = '/* __ANTIGRAVITY_FILE_ACTIONS_END__ */';
-const PATCH_VERSION_MARKER = '/* __AFA_PATCH_V3__ */';
+const PATCH_VERSION_MARKER = '/* __AFA_PATCH_V4__ */';
 const INJECT_FILENAME = 'antigravity-file-actions-inject.js';
 
 const DANGEROUS_EXTS = new Set([
   '.exe', '.bat', '.cmd', '.ps1', '.vbs', '.js', '.jse',
-  '.wsf', '.msi', '.scr', '.hta', '.com', '.pif', '.reg', '.msc', '.jar'
+  '.wsf', '.msi', '.scr', '.hta', '.com', '.pif', '.reg', '.msc', '.jar',
+  '.app', '.command', '.sh', '.zsh', '.bash', '.csh', '.pkg', '.dmg',
+  '.workflow', '.scpt', '.applescript', '.tool', '.action', '.osax'
 ]);
 
 const registeredWorkspaces = new Set();
@@ -29,12 +36,32 @@ const bridgeDiagnostics = {
 // -----------------------------------------------------------------------------
 // 1. Path Normalization & Workspace Resolution
 // -----------------------------------------------------------------------------
+function normalizePlatformPath(inputPath) {
+  if (!inputPath || typeof inputPath !== 'string') return '';
+  let s = inputPath.trim();
+  if (!s) return '';
+  if (IS_WIN) {
+    let norm = path.win32.normalize(s);
+    if (/^[a-z]:\\/.test(norm)) {
+      norm = norm[0].toUpperCase() + norm.slice(1);
+    }
+    return norm;
+  }
+  if (s === '~' || s.startsWith('~/')) {
+    const home = os.homedir();
+    s = s === '~' ? home : path.posix.join(home, s.slice(2));
+  }
+  return path.posix.normalize(s);
+}
+
 function stripLineAndColSuffix(raw) {
   if (!raw || typeof raw !== 'string') return '';
   let s = raw.trim();
   // Preserve full path if it literally exists on disk with # in filename
   try {
-    if (/^[a-zA-Z]:[\\/]/.test(s) && fs.existsSync(s)) return s;
+    if (((IS_WIN && /^[a-zA-Z]:[\\/]/.test(s)) || (!IS_WIN && s.startsWith('/'))) && fs.existsSync(s)) {
+      return s;
+    }
   } catch (_) { }
   s = s.replace(/#(?:L?\d+(?:[-:–]L?\d+)?|\d+)$/i, '');
   s = s.replace(/\?[^\\/\r\n]+$/, '');
@@ -53,8 +80,12 @@ function getAllWorkspaceRoots(extraHints = []) {
   const roots = [];
   const addRoot = (p) => {
     if (!p || typeof p !== 'string') return;
-    const norm = path.win32.normalize(p.trim());
-    if (norm && !roots.some(r => r.toLowerCase() === norm.toLowerCase())) {
+    const norm = normalizePlatformPath(p);
+    if (!norm) return;
+    const exists = IS_WIN
+      ? roots.some(r => r.toLowerCase() === norm.toLowerCase())
+      : roots.includes(norm);
+    if (!exists) {
       roots.push(norm);
     }
   };
@@ -72,7 +103,7 @@ function getAllWorkspaceRoots(extraHints = []) {
   return roots;
 }
 
-function resolveToWindowsPath(rawInput, extraHints = []) {
+function resolveLocalPath(rawInput, extraHints = []) {
   if (typeof rawInput !== 'string') return undefined;
   let s = rawInput.trim();
   if (!s) return undefined;
@@ -82,37 +113,59 @@ function resolveToWindowsPath(rawInput, extraHints = []) {
   if (md) s = md[1].trim().replace(/^<|>$/g, '');
 
   if (/^file:\/\//i.test(s)) {
-    const strippedUri = s.replace(/#(?:L?\d+(?:[-:–]L?\d+)?|\d+)$/i, '');
-    let p = strippedUri.replace(/^file:\/\/\/?/i, '');
+    const decodeUriSafe = (str) => {
+      try {
+        return decodeURIComponent(str);
+      } catch (_) {
+        return str.replace(/(?:%[0-9A-Fa-f]{2})+/g, (m) => {
+          try { return decodeURIComponent(m); } catch (__) { return m; }
+        });
+      }
+    };
+    let literalPath = decodeUriSafe(s.replace(/^file:\/\/(?:localhost)?/i, ''));
+    if (IS_WIN && /^\/[a-zA-Z]:/.test(literalPath)) literalPath = literalPath.slice(1);
+    else if (!IS_WIN && !literalPath.startsWith('/')) literalPath = '/' + literalPath;
+
+    let literalExists = false;
     try {
-      p = decodeURIComponent(p);
-    } catch (_) {
-      p = p.replace(/(?:%[0-9A-Fa-f]{2})+/g, (m) => {
-        try { return decodeURIComponent(m); } catch (__) { return m; }
-      });
+      literalExists = fs.existsSync(literalPath);
+    } catch (_) { }
+
+    if (literalExists) {
+      s = literalPath;
+    } else {
+      const strippedUri = s.replace(/#(?:L?\d+(?:[-:–]L?\d+)?|\d+)$/i, '');
+      let p = decodeUriSafe(strippedUri.replace(/^file:\/\/(?:localhost)?/i, ''));
+      if (IS_WIN && /^\/[a-zA-Z]:/.test(p)) p = p.slice(1);
+      else if (!IS_WIN && !p.startsWith('/')) p = '/' + p;
+      s = p;
     }
-    if (/^\/[a-zA-Z]:/.test(p)) p = p.slice(1);
-    s = p;
   }
 
   s = stripLineAndColSuffix(s);
   if (!s) return undefined;
 
-  // Absolute Windows drive path or UNC path
-  if (/^[a-zA-Z]:[\\/]/.test(s) || /^\\\\/.test(s)) {
-    let norm = path.win32.normalize(s);
-    if (/^[a-z]:\\/.test(norm)) {
-      norm = norm[0].toUpperCase() + norm.slice(1);
+  // Home-dir shorthand on POSIX
+  if (!IS_WIN && (s === '~' || s.startsWith('~/'))) {
+    return normalizePlatformPath(s);
+  }
+
+  // Absolute path (Windows drive/UNC or POSIX leading /)
+  if (IS_WIN) {
+    if (/^[a-zA-Z]:[\\/]/.test(s) || /^\\\\/.test(s)) {
+      return normalizePlatformPath(s);
     }
-    return norm;
+  } else if (s.startsWith('/')) {
+    return path.posix.normalize(s);
   }
 
   // Relative path resolution against known workspace roots
+  const pathMod = IS_WIN ? path.win32 : path.posix;
   const roots = getAllWorkspaceRoots(extraHints);
   for (const root of roots) {
-    const candidate = path.win32.resolve(root, s);
+    const candidate = pathMod.resolve(root, s);
     try {
-      if (fs.existsSync(candidate)) return candidate;
+      if (fs.existsSync(candidate)) return normalizePlatformPath(candidate);
     } catch (_) { }
   }
 
@@ -122,32 +175,37 @@ function resolveToWindowsPath(rawInput, extraHints = []) {
       const entries = fs.readdirSync(root, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
-        const candidate = path.win32.resolve(root, entry.name, s);
-        if (fs.existsSync(candidate)) return candidate;
+        const candidate = pathMod.resolve(root, entry.name, s);
+        if (fs.existsSync(candidate)) return normalizePlatformPath(candidate);
       }
     } catch (_) { }
   }
 
   if (roots.length > 0) {
-    return path.win32.resolve(roots[0], s);
+    return normalizePlatformPath(pathMod.resolve(roots[0], s));
   }
-  return path.win32.normalize(s);
+  return normalizePlatformPath(s);
 }
 
+const resolveToWindowsPath = resolveLocalPath;
+
 function inspectPathStatus(rawInput, extraHints = []) {
-  const resolvedPath = resolveToWindowsPath(rawInput, extraHints);
+  const resolvedPath = resolveLocalPath(rawInput, extraHints);
   if (!resolvedPath) {
     return { ok: false, exists: false, resolvedPath: '' };
   }
   let exists = false;
   let isDirectory = false;
+  let mode = 0;
   try {
     const stat = fs.statSync(resolvedPath);
     exists = true;
     isDirectory = stat.isDirectory();
+    mode = stat.mode;
   } catch (_) { }
   const ext = path.extname(resolvedPath).toLowerCase();
-  const isDangerous = DANGEROUS_EXTS.has(ext);
+  const isExecutablePosix = !IS_WIN && exists && !isDirectory && ext === '' && (mode & 0o111) !== 0;
+  const isDangerous = DANGEROUS_EXTS.has(ext) || isExecutablePosix;
   return {
     ok: true,
     exists,
@@ -158,7 +216,7 @@ function inspectPathStatus(rawInput, extraHints = []) {
 }
 
 // -----------------------------------------------------------------------------
-// 2. OS File Operations (Windows 10/11)
+// 2. OS File Operations (macOS / Windows 10/11)
 // -----------------------------------------------------------------------------
 const STRIPPED_ENV_EXACT = new Set([
   'CHROME_CRASHPAD_PIPE_NAME',
@@ -204,14 +262,36 @@ function execPowerShellEncoded(psScript) {
   });
 }
 
-async function defaultOpen(file, options = {}) {
-  if (process.platform !== 'win32') {
-    throw new Error('当前插件仅支持 Windows 10/11。');
-  }
-  const normalized = path.win32.normalize(file);
-  const ext = path.extname(normalized).toLowerCase();
+function execMacOpen(args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      '/usr/bin/open',
+      args,
+      { env: buildCleanExternalEnv() },
+      (error, _stdout, stderr) => {
+        if (!error) return resolve();
+        const detail = (stderr || '').trim();
+        reject(detail ? new Error(detail) : error);
+      }
+    );
+  });
+}
 
-  if (DANGEROUS_EXTS.has(ext) && !options.confirmed) {
+async function defaultOpen(file, options = {}) {
+  if (!IS_SUPPORTED_PLATFORM) {
+    throw new Error('当前插件仅支持 macOS 与 Windows 10/11。');
+  }
+  const normalized = normalizePlatformPath(file);
+  const ext = path.extname(normalized).toLowerCase();
+  let isExecutablePosix = false;
+  if (!IS_WIN && ext === '') {
+    try {
+      const stat = fs.statSync(normalized);
+      isExecutablePosix = !stat.isDirectory() && (stat.mode & 0o111) !== 0;
+    } catch (_) { }
+  }
+
+  if ((DANGEROUS_EXTS.has(ext) || isExecutablePosix) && !options.confirmed) {
     const response = await vscode.window.showWarningMessage(
       `打开 ${path.basename(normalized)} 可能执行程序或脚本。确定要运行吗？`,
       { modal: true },
@@ -222,6 +302,11 @@ async function defaultOpen(file, options = {}) {
       err.cancelled = true;
       throw err;
     }
+  }
+
+  if (IS_MAC) {
+    await execMacOpen([normalized]);
+    return;
   }
 
   const escaped = normalized.replace(/'/g, "''");
@@ -238,11 +323,22 @@ async function defaultOpen(file, options = {}) {
 }
 
 async function revealInExplorer(file) {
-  if (process.platform !== 'win32') {
-    throw new Error('当前插件仅支持 Windows 10/11。');
+  if (!IS_SUPPORTED_PLATFORM) {
+    throw new Error('当前插件仅支持 macOS 与 Windows 10/11。');
   }
-  const normalized = path.win32.normalize(file);
+  const normalized = normalizePlatformPath(file);
   const stat = await fs.promises.stat(normalized);
+
+  if (IS_MAC) {
+    if (!stat.isDirectory()) {
+      try {
+        await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(normalized));
+        return;
+      } catch (_) { }
+    }
+    await execMacOpen(['-R', normalized]);
+    return;
+  }
 
   // Prefer VS Code / Electron native shell.showItemInFolder (SHOpenFolderAndSelectItems)
   if (!stat.isDirectory()) {
@@ -269,7 +365,7 @@ async function revealInExplorer(file) {
 }
 
 async function copyAbsolutePath(file) {
-  const normalized = path.win32.normalize(file);
+  const normalized = normalizePlatformPath(file);
   await vscode.env.clipboard.writeText(normalized);
 }
 
@@ -313,6 +409,7 @@ async function handleBridgeRequest(req, res) {
     sendJson(res, 200, {
       ok: true,
       service: 'antigravity-file-actions',
+      platform: process.platform,
       workspaces: getAllWorkspaceRoots(),
       diagnostics: bridgeDiagnostics
     });
@@ -327,7 +424,10 @@ async function handleBridgeRequest(req, res) {
     const body = await readJsonBody(req);
     const hints = Array.isArray(body.workspaceHints) ? body.workspaceHints : [];
     for (const h of hints) {
-      if (typeof h === 'string' && h.trim()) registeredWorkspaces.add(path.win32.normalize(h.trim()));
+      if (typeof h === 'string' && h.trim()) {
+        const normHint = normalizePlatformPath(h.trim());
+        if (normHint) registeredWorkspaces.add(normHint);
+      }
     }
 
     if (req.url === '/register-workspace') {
@@ -562,9 +662,11 @@ ${PATCH_VERSION_MARKER}
     if (rawUrl.startsWith("/__antigravity_file_actions_inject__.js")) {
       try {
         let code = fs.readFileSync(injectFilePath, "utf8");
-        if (lastWorkspaceUri) {
-          code = "window.__AFA_WORKSPACE_URI__ = " + JSON.stringify(lastWorkspaceUri) + ";\\n" + code;
-        }
+        const prefix = [
+          "window.__AFA_PLATFORM__ = " + ${JSON.stringify(JSON.stringify(process.platform))} + ";",
+          lastWorkspaceUri ? ("window.__AFA_WORKSPACE_URI__ = " + JSON.stringify(lastWorkspaceUri) + ";") : ""
+        ].filter(Boolean).join("\\n");
+        code = prefix + "\\n" + code;
         res.writeHead(200, {
           "Content-Type": "application/javascript; charset=utf-8",
           "Cache-Control": "no-store, no-cache, must-revalidate"
@@ -622,10 +724,11 @@ ${PATCH_VERSION_MARKER}
         upRes.on("data", c => chunks.push(c));
         upRes.on("end", () => {
           let html = Buffer.concat(chunks).toString("utf8");
+          const platformScript = "<script>window.__AFA_PLATFORM__ = " + ${JSON.stringify(JSON.stringify(process.platform))} + ";</script>";
           const wsScript = lastWorkspaceUri
             ? "<script>window.__AFA_WORKSPACE_URI__ = " + JSON.stringify(lastWorkspaceUri) + ";</script>"
             : "";
-          const scriptTag = wsScript + '<script src="/__antigravity_file_actions_inject__.js"></script>';
+          const scriptTag = platformScript + wsScript + '<script src="/__antigravity_file_actions_inject__.js"></script>';
           if (!html.includes("__antigravity_file_actions_inject__.js")) {
             if (html.includes("</body>")) {
               html = html.replace("</body>", scriptTag + "</body>");
@@ -651,10 +754,11 @@ ${PATCH_VERSION_MARKER}
           let js = Buffer.concat(chunks).toString("utf8");
           try {
             const injectCode = fs.readFileSync(injectFilePath, "utf8");
+            const platformInit = "\\nwindow.__AFA_PLATFORM__ = " + ${JSON.stringify(JSON.stringify(process.platform))} + ";\\n";
             const wsInit = lastWorkspaceUri
-              ? "\\nwindow.__AFA_WORKSPACE_URI__ = " + JSON.stringify(lastWorkspaceUri) + ";\\n"
-              : "\\n";
-            js += wsInit + injectCode + "\\n";
+              ? "window.__AFA_WORKSPACE_URI__ = " + JSON.stringify(lastWorkspaceUri) + ";\\n"
+              : "";
+            js += platformInit + wsInit + injectCode + "\\n";
           } catch (_) {}
           const respHeaders = { ...upRes.headers };
           delete respHeaders["content-length"];
@@ -817,9 +921,11 @@ function installRendererPatch(extensionPath, appRoot) {
       agyContent = fs.readFileSync(agyBackup, 'utf8');
     }
 
-    const origPs = 'async function PS(a,b){var c=f.asyncContextStart(),d=c();c=c(1);try{return{effectiveUrl:c(await d(n.env.asExternalUri(n.Uri.parse(a)))).toString().replace(/\\/$/,""),humanReadable:b}}finally{d()}}';
-    const hookedPs = 'async function PS(a,b){var c=f.asyncContextStart(),d=c();c=c(1);try{var __eff=c(await d(n.env.asExternalUri(n.Uri.parse(a)))).toString().replace(/\\/$/,"");if(typeof globalThis.__afaWrapHubUrlAsync==="function")__eff=c(await d(globalThis.__afaWrapHubUrlAsync(__eff)));return{effectiveUrl:__eff,humanReadable:b}}finally{d()}}';
-    agyContent = agyContent.replace(origPs, hookedPs);
+    const psRegex = /async function ([A-Za-z0-9_$]+)\(([A-Za-z0-9_$]+),([A-Za-z0-9_$]+)\)\{var ([A-Za-z0-9_$]+)=([A-Za-z0-9_$]+)\.asyncContextStart\(\),([A-Za-z0-9_$]+)=\4\(\);\4=\4\(1\);try\{return\{effectiveUrl:\4\(await \6\(([A-Za-z0-9_$]+)\.env\.asExternalUri\(\7\.Uri\.parse\(\2\)\)\)\)\.toString\(\)\.replace\(\/\\\/\$\/,""\),humanReadable:\3\}\}finally\{\6\(\)\}\}/;
+    agyContent = agyContent.replace(
+      psRegex,
+      'async function $1($2,$3){var $4=$5.asyncContextStart(),$6=$4();$4=$4(1);try{var __eff=$4(await $6($7.env.asExternalUri($7.Uri.parse($2)))).toString().replace(/\\/$/,"");if(typeof globalThis.__afaWrapHubUrlAsync==="function")__eff=$4(await $6(globalThis.__afaWrapHubUrlAsync(__eff)));return{effectiveUrl:__eff,humanReadable:$3}}finally{$6()}}'
+    );
 
     const origValidate = 'validateServerUrl(a){try{let b=new URL(a);if(b.protocol!=="http:"&&b.protocol!=="https:")throw Error("Protocol must be HTTP or HTTPS");return a.endsWith("/")?a:`${a}/`}catch(b){throw Error(`Invalid server URL: ${a}`);}}';
     const hookedValidate = 'validateServerUrl(a){try{let b=new URL(a);if(b.protocol!=="http:"&&b.protocol!=="https:")throw Error("Protocol must be HTTP or HTTPS");var __u=a.endsWith("/")?a:`${a}/`;return typeof globalThis.__afaWrapHubUrl==="function"?globalThis.__afaWrapHubUrl(__u):__u}catch(b){throw Error(`Invalid server URL: ${a}`);}}';
@@ -873,6 +979,7 @@ function uninstallRendererPatch(appRoot) {
     const backupPath = `${t.filePath}.afa-backup`;
     if (fs.existsSync(backupPath)) {
       fs.copyFileSync(backupPath, t.filePath);
+      try { fs.unlinkSync(backupPath); } catch (_) { }
     } else {
       const content = fs.readFileSync(t.filePath, 'utf8').replace(blockRegex, '');
       fs.writeFileSync(t.filePath, content, 'utf8');
@@ -883,19 +990,26 @@ function uninstallRendererPatch(appRoot) {
     const agyBackup = `${paths.agyVscodeExtPath}.afa-backup`;
     if (fs.existsSync(agyBackup)) {
       fs.copyFileSync(agyBackup, paths.agyVscodeExtPath);
+      try { fs.unlinkSync(agyBackup); } catch (_) { }
     }
   }
 
   if (fs.existsSync(paths.productJsonPath)) {
-    const rawProduct = fs.readFileSync(paths.productJsonPath, 'utf8');
-    const product = JSON.parse(rawProduct);
-    if (product.checksums) {
-      for (const t of paths.targets) {
-        if (fs.existsSync(t.filePath) && t.checksumKey in product.checksums) {
-          product.checksums[t.checksumKey] = computeVscodeChecksum(t.filePath);
+    const productBackup = `${paths.productJsonPath}.afa-backup`;
+    if (fs.existsSync(productBackup)) {
+      fs.copyFileSync(productBackup, paths.productJsonPath);
+      try { fs.unlinkSync(productBackup); } catch (_) { }
+    } else {
+      const rawProduct = fs.readFileSync(paths.productJsonPath, 'utf8');
+      const product = JSON.parse(rawProduct);
+      if (product.checksums) {
+        for (const t of paths.targets) {
+          if (fs.existsSync(t.filePath) && t.checksumKey in product.checksums) {
+            product.checksums[t.checksumKey] = computeVscodeChecksum(t.filePath);
+          }
         }
+        fs.writeFileSync(paths.productJsonPath, JSON.stringify(product, null, '\t'), 'utf8');
       }
-      fs.writeFileSync(paths.productJsonPath, JSON.stringify(product, null, '\t'), 'utf8');
     }
   }
 
@@ -907,18 +1021,18 @@ function uninstallRendererPatch(appRoot) {
 // -----------------------------------------------------------------------------
 async function promptOrGetPath(uri) {
   if (uri instanceof vscode.Uri && uri.scheme === 'file') return uri.fsPath;
-  if (typeof uri === 'string' && uri.trim()) return resolveToWindowsPath(uri);
+  if (typeof uri === 'string' && uri.trim()) return resolveLocalPath(uri);
 
   const active = vscode.window.activeTextEditor;
   const copied = await vscode.env.clipboard.readText();
   const suggested = copied.length < 2048 ? copied.trim() : '';
   const entered = await vscode.window.showInputBox({
     title: '文件操作：输入文件路径（支持从 AI 对话复制）',
-    prompt: '支持 Windows 绝对路径与工作区相对路径。',
+    prompt: '支持本地绝对路径（macOS / Windows）与工作区相对路径。',
     value: suggested && !suggested.includes('\n') ? suggested : (active ? active.document.uri.fsPath : ''),
     ignoreFocusOut: true
   });
-  return entered === undefined ? undefined : resolveToWindowsPath(entered);
+  return entered === undefined ? undefined : resolveLocalPath(entered);
 }
 
 async function validatedPath(uri) {
@@ -937,18 +1051,43 @@ function activate(context) {
   // 1. Start local loopback bridge for renderer context menu
   startBridgeServer(context);
 
-  // 2. Auto-ensure renderer patch is installed and up to date
+  // 2. Ensure renderer patch (auto on Windows; opt-in prompt on macOS due to signed .app bundle)
   try {
     if (!isPatchInstalledAndCurrent(context.extensionPath)) {
-      installRendererPatch(context.extensionPath);
-      vscode.window.showInformationMessage(
-        'Antigravity File Actions：已启用/更新 AI 对话窗口右键菜单支持，重载窗口后生效。',
-        '立即重载窗口'
-      ).then((choice) => {
-        if (choice === '立即重载窗口') {
-          vscode.commands.executeCommand('workbench.action.reloadWindow');
-        }
-      });
+      if (IS_WIN) {
+        installRendererPatch(context.extensionPath);
+        vscode.window.showInformationMessage(
+          'Antigravity File Actions：已启用/更新 AI 对话窗口右键菜单支持，重载窗口后生效。',
+          '立即重载窗口'
+        ).then((choice) => {
+          if (choice === '立即重载窗口') {
+            vscode.commands.executeCommand('workbench.action.reloadWindow');
+          }
+        });
+      } else if (IS_MAC && context.globalState.get('afaPatchPromptDismissedVersion') !== PATCH_VERSION_MARKER) {
+        vscode.window.showInformationMessage(
+          'Antigravity File Actions：是否安装 AI 对话窗口右键菜单补丁？（将修改应用包内脚本并创建备份，可随时一键恢复）',
+          '立即安装补丁',
+          '暂不安装'
+        ).then(async (choice) => {
+          if (choice === '立即安装补丁') {
+            try {
+              installRendererPatch(context.extensionPath);
+              const reloadChoice = await vscode.window.showInformationMessage(
+                'AI 对话窗口右键菜单补丁已安装成功！重载窗口后生效。',
+                '立即重载窗口'
+              );
+              if (reloadChoice === '立即重载窗口') {
+                await vscode.commands.executeCommand('workbench.action.reloadWindow');
+              }
+            } catch (err) {
+              vscode.window.showErrorMessage(`安装对话右键菜单补丁失败：${err.message}`);
+            }
+          } else if (choice === '暂不安装') {
+            await context.globalState.update('afaPatchPromptDismissedVersion', PATCH_VERSION_MARKER);
+          }
+        });
+      }
     }
   } catch (err) {
     console.warn('[AntigravityFileActions] Auto patch check warning:', err);
@@ -1059,8 +1198,11 @@ module.exports = {
   deactivate,
   installRendererPatch,
   uninstallRendererPatch,
+  resolveLocalPath,
   resolveToWindowsPath,
+  normalizePlatformPath,
   inspectPathStatus,
   buildCleanExternalEnv,
-  defaultOpen
+  defaultOpen,
+  revealInExplorer
 };
